@@ -1301,3 +1301,277 @@ def test_close_wakes_idle_worker_promptly() -> None:
     started = time.monotonic()
     sink.close(timeout=5.0)
     assert time.monotonic() - started < dl._FLUSH_INTERVAL_S / 2
+
+
+# ── bounded shutdown drain ──────────────────────────────────────────────────
+
+
+def test_close_drain_stops_at_the_deadline_and_counts_the_rest(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A slow endpoint can't stretch close(); unsent rows are dropped and counted."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    delivered: list[str] = []
+    gate = threading.Event()
+
+    def slow_send(batch: list[dl.DebugLogRow]) -> None:
+        gate.wait(timeout=5)
+        time.sleep(0.2)
+        delivered.extend(str(row["message"]) for row in batch)
+
+    sink = dl.DebugLogHandler("runner", slow_send)
+    logger = _sink_logger("test.debug_logging.bounded", sink)
+    try:
+        for i in range(500):
+            logger.info("row %d", i)
+        gate.set()
+        started = time.monotonic()
+        sink.close(timeout=0.5)
+        elapsed = time.monotonic() - started
+    finally:
+        logger.removeHandler(sink)
+    sink._thread.join(timeout=5)  # let a batch already being sent finish
+
+    assert elapsed < 0.9
+    (drop,) = [r for r in caplog.records if "shutdown deadline passed" in r.getMessage()]
+    dropped = int(drop.getMessage().split("dropped ")[1].split(" ")[0])
+    assert 0 < len(delivered) < 500
+    assert len(delivered) + dropped == 500  # nothing both sent and dropped
+
+
+class _FakeZerobus:
+    """Fake httpx client: mints a token, answers inserts from a script."""
+
+    def __init__(
+        self,
+        outcomes: list[object],
+        *,
+        mint_delay: float = 0.0,
+        insert_delay: float = 0.0,
+        mint_gate: threading.Event | None = None,
+        insert_gate: threading.Event | None = None,
+    ) -> None:
+        self._outcomes = outcomes
+        self._mint_delay = mint_delay
+        self._insert_delay = insert_delay
+        self._mint_gate = mint_gate
+        self._insert_gate = insert_gate
+        self.mints = 0
+        self.inserts = 0
+        self.insert_timeouts: list[float] = []
+        self.inserted: list[str] = []
+        self.in_mint = threading.Event()
+        self.in_insert = threading.Event()
+
+    def post(self, url: str, **kwargs: object) -> httpx.Response:
+        if url.endswith("/oidc/v1/token"):
+            self.mints += 1
+            self.in_mint.set()
+            if self._mint_gate is not None:
+                self._mint_gate.wait(timeout=10)
+            time.sleep(self._mint_delay)
+            return httpx.Response(200, json={"access_token": "token", "expires_in": 3600})
+        self.inserts += 1
+        self.insert_timeouts.append(float(kwargs["timeout"]))  # type: ignore[arg-type]
+        self.in_insert.set()
+        if self._insert_gate is not None:
+            self._insert_gate.wait(timeout=10)
+        time.sleep(self._insert_delay)
+        outcome = self._outcomes[min(self.inserts, len(self._outcomes)) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert isinstance(outcome, int)
+        if outcome == 200:
+            self.inserted.extend(r["message"] for r in json.loads(str(kwargs["content"])))
+        return httpx.Response(outcome)
+
+    def close(self) -> None:
+        pass
+
+
+def _bare_zerobus_sink(client: _FakeZerobus) -> dl.ZerobusLogHandler:
+    config = dl.config_from_env()
+    assert config is not None
+    sink = object.__new__(dl.ZerobusLogHandler)
+    sink._config = config
+    sink._client = client  # type: ignore[assignment]
+    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    sink._delivered_any = False
+    return sink
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "inserts"),
+    [
+        # The insert may have landed: resending could duplicate it.
+        ([httpx.ReadTimeout("slow")], 1),
+        ([httpx.RemoteProtocolError("reset")], 1),
+        # Never sent: safe to retry.
+        ([httpx.ConnectError("offline")], 3),
+        ([httpx.ConnectError("blip"), 200], 2),
+    ],
+)
+def test_post_retries_only_requests_that_cannot_have_landed(
+    _configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[object],
+    inserts: int,
+) -> None:
+    monkeypatch.setattr(dl.time, "sleep", lambda _s: None)
+    client = _FakeZerobus(outcomes)
+    _bare_zerobus_sink(client)._post([{"message": "m"}])
+    assert client.inserts == inserts
+
+
+def test_post_during_the_drain_fits_the_deadline(_configured_env: None) -> None:
+    client = _FakeZerobus([200])
+    sink = _bare_zerobus_sink(client)
+    sink._drain_deadline = time.monotonic() + 0.5
+
+    sink._post([{"message": "m"}])
+
+    assert client.inserts == 1
+    assert 0 < client.insert_timeouts[0] <= 0.5
+
+
+@pytest.mark.parametrize(
+    ("budget", "mint_delay"),
+    [(-1.0, 0.0), (0.25, 0.2)],
+    ids=["spent-deadline", "mint-uses-up-the-budget"],
+)
+def test_post_sends_nothing_without_time_left(
+    _configured_env: None, budget: float, mint_delay: float
+) -> None:
+    client = _FakeZerobus([200], mint_delay=mint_delay)
+    sink = _bare_zerobus_sink(client)
+    sink._drain_deadline = time.monotonic() + budget
+
+    with pytest.raises(dl._ShutdownDeadline):
+        sink._post([{"message": "m"}])
+
+    assert client.inserts == 0
+    assert client.mints == (0 if budget < 0 else 1)  # no mint starts without time left
+
+
+def test_shutdown_mint_never_runs_an_unresolved_secret_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The secret command is an unbounded subprocess; never run it at shutdown."""
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com")
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+    config = dl.config_from_env()
+    assert config is not None
+    ran: list[object] = []
+    monkeypatch.setattr(dl.subprocess, "run", lambda *a, **_k: ran.append(a))
+    tokens = dl._TokenSource(config, _FakeZerobus([200]))  # type: ignore[arg-type]
+
+    assert tokens.token(deadline=time.monotonic() + 1) is None
+    assert ran == []
+
+
+def _live_zerobus_sink(
+    monkeypatch: pytest.MonkeyPatch, client: _FakeZerobus
+) -> tuple[dl.ZerobusLogHandler, logging.Logger]:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl.httpx, "Client", lambda **_: client)
+    config = dl.config_from_env()
+    assert config is not None
+    sink = dl.ZerobusLogHandler(config, "host")
+    return sink, _sink_logger(f"test.debug_logging.live.{id(sink)}", sink)
+
+
+def _dropped_counts(caplog: pytest.LogCaptureFixture) -> list[int]:
+    return [
+        int(r.getMessage().split("dropped ")[1].split(" ")[0])
+        for r in caplog.records
+        if "shutdown deadline passed" in r.getMessage()
+    ]
+
+
+def test_close_reports_all_rows_discarded_after_post_budget_expires(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One diagnostic covers the batch that ran out of budget and the rest of the queue."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    gate = threading.Event()
+    # The pre-close insert succeeds; the drain's next batch then fails before
+    # reaching ZeroBus until _post() itself runs out of budget mid-retry, and
+    # the drain drops the rest of the queue.
+    client = _FakeZerobus(
+        [200, httpx.ConnectError("offline")], insert_gate=gate, insert_delay=0.15
+    )
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    try:
+        logger.info("first")
+        assert client.in_insert.wait(timeout=2)
+        for i in range(249):
+            logger.info("row %d", i)
+        threading.Timer(0.05, gate.set).start()  # the pre-close insert returns mid-close
+        sink.close(timeout=0.5)
+    finally:
+        logger.removeHandler(sink)
+    sink._thread.join(timeout=5)
+
+    drops = _dropped_counts(caplog)
+    assert client.inserted == ["first"]
+    assert drops == [249]  # one diagnostic, every unsent row counted
+
+
+def test_close_deadline_is_observed_after_inflight_token_mint(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A mint that began before close() and finishes after the deadline starts no insert."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    mint_gate = threading.Event()
+    client = _FakeZerobus([200], mint_gate=mint_gate)
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    try:
+        logger.info("waiting on the token")
+        assert client.in_mint.wait(timeout=2)
+        sink.close(timeout=0.2)
+        mint_gate.set()  # the mint finishes only after the deadline
+    finally:
+        logger.removeHandler(sink)
+    sink._thread.join(timeout=5)
+
+    assert client.inserts == 0
+    assert _dropped_counts(caplog) == [1]
+
+
+def test_close_deadline_is_observed_after_inflight_insert_fails(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed pre-close insert isn't retried past the deadline with a fresh 10s timeout."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    insert_gate = threading.Event()
+    client = _FakeZerobus([httpx.ConnectError("offline")], insert_gate=insert_gate)
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    try:
+        logger.info("in flight")
+        assert client.in_insert.wait(timeout=2)
+        sink.close(timeout=0.2)
+        insert_gate.set()  # fails with ConnectError after the deadline
+    finally:
+        logger.removeHandler(sink)
+    sink._thread.join(timeout=5)
+
+    assert client.inserts == 1
+    assert _dropped_counts(caplog) == [1]
+
+
+def test_near_deadline_auth_rejection_does_not_start_a_new_mint(_configured_env: None) -> None:
+    client = _FakeZerobus([401, 200], insert_delay=0.25)
+    sink = _bare_zerobus_sink(client)
+    sink._drain_deadline = time.monotonic() + 0.3  # the 401 lands with ~0.05s left
+
+    with pytest.raises(dl._ShutdownDeadline):
+        sink._post([{"message": "m"}])
+
+    assert client.mints == 1
+    assert client.inserts == 1
