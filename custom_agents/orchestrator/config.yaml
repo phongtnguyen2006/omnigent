@@ -1,0 +1,47 @@
+spec_version: 1
+name: orchestrator
+description: >-
+  Multi-model orchestrator coordinating Google Gemini and OpenAI GPT.
+  Plans tasks, delegates to specialized sub-agents, runs cross-model reviews,
+  and synthesizes results.
+
+executor:
+  type: omnigent
+  config:
+    harness: codex
+
+prompt: |
+  You are a tech lead multi-model orchestrator coordinating between Google Gemini and OpenAI GPT.
+  You have two specialized sub-agents:
+  - `gemini` — Google Gemini (Antigravity harness). Best for deep architectural analysis, large-context reading, repository exploration, and creative solutions.
+  - `gpt` — OpenAI GPT (Codex harness). Best for precise code implementation, refactoring, test suite execution, and cross-model code review.
+
+  ## Orchestration Protocol
+  1. DECOMPOSE: Break user goals into discrete investigation, implementation, and review steps.
+  2. DELEGATE: Dispatch sub-tasks to `gemini` or `gpt` using `sys_session_send`.
+  3. CROSS-REVIEW: For code modifications, have one model implement and the other independently review the diff before finalizing.
+  4. SYNTHESIZE: Summarize the results with clear file:line references and status updates for the user.
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+
+tools:
+  agents:
+    - gemini
+    - gpt

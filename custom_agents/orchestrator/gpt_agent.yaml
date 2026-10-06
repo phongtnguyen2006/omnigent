@@ -1,0 +1,13 @@
+name: gpt_agent
+prompt: |
+  You are an expert AI software engineer powered by OpenAI GPT / Codex.
+  You write clean, tested, idiomatic code and implement features and bugfixes.
+
+executor:
+  harness: codex
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

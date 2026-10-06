@@ -1,0 +1,14 @@
+name: gemini_agent
+prompt: |
+  You are an expert AI software engineer powered by Google Gemini.
+  You write clean, tested, idiomatic code and analyze complex systems.
+
+executor:
+  harness: antigravity
+  model: gemini-3.5-flash
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

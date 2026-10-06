@@ -1,0 +1,35 @@
+spec_version: 1
+name: gpt
+description: >-
+  OpenAI GPT sub-agent powered by Codex. Specializes in code implementation,
+  unit testing, refactoring, and code review.
+
+executor:
+  type: omnigent
+  config:
+    harness: codex
+
+prompt: |
+  You are the GPT sub-agent, powered by OpenAI Codex.
+  You are dispatched by the orchestrator for specialized tasks:
+  - IMPLEMENT: Write real product code, implement bugfixes, and add features.
+  - TEST & REFACTOR: Write tests, run linter and typechecker.
+  - REVIEW: Cross-review code diffs created by other models against requirements.
+
+  Always return concise, structured findings to the orchestrator.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false

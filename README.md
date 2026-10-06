@@ -21,6 +21,22 @@ Omnigent is an open-source **meta-harness** that gives you a common orchestratio
 
 ---
 
+## 🎯 Custom Agents & Multi-Model Orchestrator
+
+Looking to customize prompts, models, or workflows? All custom agent definitions are separated in the **[`custom_agents/`](./custom_agents/)** directory:
+
+- 🧠 **Master Orchestrator:** [`custom_agents/orchestrator/config.yaml`](./custom_agents/orchestrator/config.yaml) — Tech Lead coordinator (Gemini + GPT)
+- 🔷 **Gemini Sub-Agent:** [`custom_agents/orchestrator/agents/gemini/config.yaml`](./custom_agents/orchestrator/agents/gemini/config.yaml) — Large-context exploration & research
+- 🟢 **GPT Sub-Agent:** [`custom_agents/orchestrator/agents/gpt/config.yaml`](./custom_agents/orchestrator/agents/gpt/config.yaml) — Code generation & cross-model review
+- 📖 **Customization Guide:** [`custom_agents/README.md`](./custom_agents/README.md) — How and where to edit prompts and models
+
+Quickstart:
+```bash
+omnigent run custom_agents/orchestrator
+```
+
+---
+
 ## Why Omnigent?
 
 Omnigent lets you:
